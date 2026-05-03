@@ -106,7 +106,9 @@ class Config:
 
     # ── Lighting (XIAO ESP32C3 over USB-C serial) ────────────────────────────
     LIGHTING_PORTS: tuple = ('/dev/ttyACM0', '/dev/ttyUSB0')
-    LIGHTING_BAUD:  int   = 9600
+    LIGHTING_BAUD:  int   = 115200
+    LEDS_PER_DRONE: int   = 36     # 144 total ÷ 4 sections
+    LED_DATA_PIN:   int   = 8      # GPIO on XIAO ESP32C3 (D8)
 
     # ── Display ──────────────────────────────────────────────────────────────
     DISPLAY_WIDTH:  int = 800

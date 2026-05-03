@@ -69,6 +69,7 @@ def main() -> None:
     state  = ExhibitState()
     motors = MotorController()
     lights = LightingController()
+    lights.set_state(state)
     seq    = SequenceRunner(state=state, motors=motors, lights=lights)
 
     # Wire LED observer: state transitions automatically call lights.set_mode()
