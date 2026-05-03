@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """
-touch_ui.py — TouchUI
-Tkinter fullscreen kiosk for the 7" DSI touchscreen (800 × 480 px).
-All rendering is programmatic — no PNG files required.
+touch_ui.py — TouchUI (PyGame)
+Fullscreen kiosk for the 7" DSI touchscreen (800 x 480 px).
+All rendering is programmatic — no image assets required.
 """
 
 import logging
 import math
 import random
 import threading
-import tkinter as tk
+import time
 from typing import TYPE_CHECKING
+
+import pygame
+import pygame.freetype
+import pygame.gfxdraw
 
 from config import cfg
 from exhibit_state import ExhibitState, State
@@ -21,644 +25,436 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# UI palette
+# Palette
 # ---------------------------------------------------------------------------
-UI_BG        = '#000000'
-PANEL_BG     = '#1a2332'
-PANEL_BORDER = '#3a5068'
-DRONE_COLORS = {1: '#00CC00', 2: '#2196F3', 3: '#FFD600', 4: '#9C27B0'}
-DRONE_LABELS = {1: 'D1',    2: 'D2',    3: 'D3',    4: 'D4'}
-SLIDER_GREEN = '#00FF00'
-SLIDER_TRACK = '#2a3a4a'
-SLIDER_BG    = '#1a2332'
-FRAME_BLUE   = '#4a7aaa'
-FRAME_RED    = '#8B0000'
-VIRUS_RED    = '#C62828'
-DONE_BLUE    = '#2196F3'
-UI_REFRESH_MS = 100
+C_BG           = (0, 0, 0)
+C_PANEL        = (26, 35, 50)
+C_PANEL_LITE   = (34, 48, 68)
+C_BORDER       = (58, 80, 104)
+C_BORDER_BLUE  = (74, 122, 170)
+C_BORDER_RED   = (139, 0, 0)
+C_TEXT          = (200, 200, 200)
+C_TEXT_DIM      = (85, 102, 119)
+C_GREEN        = (0, 255, 0)
+C_GREEN_MID    = (0, 204, 0)
+C_CYAN         = (0, 200, 230)
+C_RED          = (198, 40, 40)
+C_RED_BRIGHT   = (255, 34, 34)
+C_VIRUS_BG     = (26, 10, 10)
+C_DONE_BLUE    = (33, 150, 243)
+C_YELLOW       = (255, 214, 0)
+C_SLIDER_TRACK = (42, 58, 74)
+C_SLIDER_BG    = (26, 35, 50)
+
+DRONE_COLORS = {
+    1: (0, 204, 0),
+    2: (33, 150, 243),
+    3: (255, 214, 0),
+    4: (156, 39, 176),
+}
+DRONE_LABELS = {1: 'D1', 2: 'D2', 3: 'D3', 4: 'D4'}
+
+W = cfg.DISPLAY_WIDTH
+H = cfg.DISPLAY_HEIGHT
+FPS = 30
 _SLIDER_RANGE = max(1, cfg.SLIDER_MAX_ROT - cfg.SLIDER_MIN_ROT)
 
-
 # ---------------------------------------------------------------------------
-# IdleScreen
+# Drawing helpers
 # ---------------------------------------------------------------------------
 
-class IdleScreen:
-    """Breathing brick logo on a subtle radar background. ~30 fps after-loop."""
+def lerp_color(a: tuple, b: tuple, t: float) -> tuple:
+    t = max(0.0, min(1.0, t))
+    return tuple(int(a[i] + (b[i] - a[i]) * t) for i in range(3))
 
-    PULSE_FRAMES = 150   # 150 × 33 ms ≈ 5 s full cycle (half-cosine)
-    PULSE_LO     = 0.40
-    PULSE_HI     = 1.00
 
-    def __init__(self, parent: tk.Widget) -> None:
-        self._parent  = parent
-        self._canvas  = tk.Canvas(parent, bg=UI_BG, highlightthickness=0)
-        self._after_id = None
-        self._running  = False
-        self._t        = 0
+def draw_panel(surf: pygame.Surface, rect: pygame.Rect,
+               fill: tuple = C_PANEL, border: tuple = C_BORDER,
+               border_w: int = 2, corner: int = 0) -> None:
+    """Draw a filled panel with border.  corner>0 draws corner accents."""
+    pygame.draw.rect(surf, fill, rect)
+    pygame.draw.rect(surf, border, rect, border_w)
+    if corner > 0:
+        c = corner
+        bw = border_w
+        for (cx, cy, dx, dy) in [
+            (rect.left, rect.top, 1, 1),
+            (rect.right - 1, rect.top, -1, 1),
+            (rect.left, rect.bottom - 1, 1, -1),
+            (rect.right - 1, rect.bottom - 1, -1, -1),
+        ]:
+            pygame.draw.line(surf, border, (cx, cy), (cx + dx * c, cy), bw)
+            pygame.draw.line(surf, border, (cx, cy), (cx, cy + dy * c), bw)
 
-    def show(self) -> None:
-        self._canvas.place(x=0, y=0, relwidth=1, relheight=1)
-        self._canvas.tk.call('raise', self._canvas._w)  # Python 3.13 compat
-        self._running = True
-        self._t = 0
-        self._draw()
 
-    def hide(self) -> None:
-        self._running = False
-        if self._after_id:
-            self._parent.after_cancel(self._after_id)
-            self._after_id = None
-        self._canvas.place_forget()
+def draw_text_centered(surf: pygame.Surface, font: pygame.freetype.Font,
+                       text: str, cx: int, cy: int, color: tuple) -> pygame.Rect:
+    r = font.get_rect(text)
+    pos = (cx - r.width // 2, cy - r.height // 2)
+    font.render_to(surf, pos, text, color)
+    return pygame.Rect(pos, (r.width, r.height))
 
-    def _draw(self) -> None:
-        if not self._running:
-            return
-        c = self._canvas
-        c.delete('all')
-        w = self._parent.winfo_width()
-        h = self._parent.winfo_height()
-        cx, cy = w // 2, h // 2
 
-        # Half-cosine breathing pulse
-        phase      = (self._t % self.PULSE_FRAMES) / float(self.PULSE_FRAMES)
-        alpha      = self.PULSE_LO + (self.PULSE_HI - self.PULSE_LO) * (
-                         0.5 - 0.5 * math.cos(phase * 2 * math.pi))
-        v          = int(alpha * 255)
-        logo_color = f'#{v:02x}{v:02x}{v:02x}'
+def draw_glow_text(surf: pygame.Surface, font: pygame.freetype.Font,
+                   text: str, cx: int, cy: int, color: tuple,
+                   glow_radius: int = 3) -> None:
+    """Text with a soft glow halo behind it."""
+    glow_color = tuple(max(0, c // 3) for c in color)
+    for dx in range(-glow_radius, glow_radius + 1):
+        for dy in range(-glow_radius, glow_radius + 1):
+            if dx * dx + dy * dy <= glow_radius * glow_radius:
+                draw_text_centered(surf, font, text, cx + dx, cy + dy, glow_color)
+    draw_text_centered(surf, font, text, cx, cy, color)
 
-        # Panel border pulses in blue alongside logo
-        bv           = int(alpha * 0.6 * 255)
-        border_color = f'#0a{bv:02x}{min(int(bv * 1.3), 255):02x}'
 
-        # Radar background
-        self._draw_radar_bg(c, cx, cy, min(w, h) * 0.45)
+def rot_to_frac(rot: float) -> float:
+    return (rot - cfg.SLIDER_MIN_ROT) / _SLIDER_RANGE
 
-        # Metallic panel
-        pw = min(w - 80, 500)
-        ph = min(h - 60, 360)
-        px = cx - pw // 2
-        py = cy - ph // 2 + 10
-        c.create_rectangle(px, py, px + pw, py + ph,
-                           fill=PANEL_BG, outline=border_color, width=2)
 
-        # Title
-        c.create_text(cx, py + 40, text="VARIANT SECURITY", fill=logo_color,
-                      font=('Helvetica', 30, 'bold'), anchor='center')
-
-        # Brick logo centered in panel
-        self._draw_logo_mark(c, cx, cy + 15, min(pw, ph) * 0.42, logo_color)
-
-        # Footer
-        c.create_text(cx, py + ph - 25, text="SYSTEM STANDBY",
-                      fill='#556677', font=('Courier', 12), anchor='center')
-
-        self._t += 1
-        self._after_id = self._parent.after(33, self._draw)
-
-    @staticmethod
-    def _draw_radar_bg(canvas: tk.Canvas, cx: int, cy: int, max_r: float) -> None:
-        color = '#0a2a0a'
-        for i in range(1, 6):
-            r = max_r * i / 5
-            canvas.create_oval(cx - r, cy - r, cx + r, cy + r,
-                               outline=color, fill='', width=1)
-        canvas.create_line(cx - max_r, cy, cx + max_r, cy, fill=color, width=1)
-        canvas.create_line(cx, cy - max_r, cx, cy + max_r, fill=color, width=1)
-        for a_deg in [45, 135]:
-            a = math.radians(a_deg)
-            dx, dy = math.cos(a) * max_r, math.sin(a) * max_r
-            canvas.create_line(cx - dx, cy - dy, cx + dx, cy + dy,
-                               fill=color, width=1)
-
-    @staticmethod
-    def _draw_logo_mark(
-        canvas: tk.Canvas, cx: int, cy: int, size: float, color: str
-    ) -> None:
-        """
-        Staggered brick layout:
-            [ ][ ]         row 0 — 2 blocks, +0.5 col offset
-          [ ][ ][ ]        row 1 — 3 blocks
-          [ ][ ][ ]        row 2 — 3 blocks
-            [ ][ ]         row 3 — 2 blocks, +0.5 col offset
-        """
-        cell  = size * 0.27
-        gap   = size * 0.09
-        col_w = cell + gap
-        row_h = cell + gap
-        ox    = cx - (3 * col_w - gap) / 2
-        oy    = cy - (4 * row_h - gap) / 2
-        layout = [(0, 0.5, 2), (1, 0.0, 3), (2, 0.0, 3), (3, 0.5, 2)]
-        for (row, col_off, n) in layout:
-            for col in range(n):
-                x = ox + (col + col_off) * col_w
-                y = oy + row * row_h
-                canvas.create_rectangle(x, y, x + cell, y + cell,
-                                        fill=color, outline='', width=0)
+def frac_to_rot(frac: float) -> float:
+    frac = max(0.0, min(1.0, frac))
+    return cfg.SLIDER_MIN_ROT + frac * _SLIDER_RANGE
 
 
 # ---------------------------------------------------------------------------
-# MatrixOverlay
+# Brick logo drawing
 # ---------------------------------------------------------------------------
 
-class MatrixOverlay:
-    """Full-screen Matrix rain + COMPROMISED text + red scan lines. 15 fps."""
+def draw_brick_logo(surf: pygame.Surface, cx: int, cy: int,
+                    size: float, color: tuple) -> None:
+    cell = int(size * 0.27)
+    gap = int(size * 0.09)
+    col_w = cell + gap
+    row_h = cell + gap
+    ox = cx - (3 * col_w - gap) // 2
+    oy = cy - (4 * row_h - gap) // 2
+    layout = [(0, 0.5, 2), (1, 0.0, 3), (2, 0.0, 3), (3, 0.5, 2)]
+    for (row, col_off, n) in layout:
+        for col in range(n):
+            x = int(ox + (col + col_off) * col_w)
+            y = oy + row * row_h
+            pygame.draw.rect(surf, color, (x, y, cell, cell))
 
+
+# ---------------------------------------------------------------------------
+# Biohazard icon
+# ---------------------------------------------------------------------------
+
+def draw_biohazard(surf: pygame.Surface, cx: int, cy: int,
+                   size: float, color: tuple) -> None:
+    s = size / 50
+    for angle_deg in [90, 210, 330]:
+        a = math.radians(angle_deg)
+        ox = int(cx + math.cos(a) * 16 * s)
+        oy = int(cy - math.sin(a) * 16 * s)
+        r = int(14 * s)
+        pygame.draw.circle(surf, color, (ox, oy), r, max(1, int(2 * s)))
+    pygame.draw.circle(surf, color, (cx, cy), int(5 * s), max(1, int(2 * s)))
+    pygame.draw.circle(surf, color, (cx, cy), int(2 * s))
+
+
+# ---------------------------------------------------------------------------
+# Shield icon
+# ---------------------------------------------------------------------------
+
+def draw_shield(surf: pygame.Surface, cx: int, cy: int,
+                size: int, color: tuple) -> None:
+    s = size
+    points = [
+        (cx, cy - s),
+        (cx + s, cy - s // 2),
+        (cx + s, cy + s // 4),
+        (cx, cy + s),
+        (cx - s, cy + s // 4),
+        (cx - s, cy - s // 2),
+    ]
+    pygame.draw.polygon(surf, color, points, 2)
+    pygame.draw.line(surf, color, (cx, cy - s // 2), (cx, cy + s // 3), 2)
+    pygame.draw.line(surf, color, (cx - s // 3, cy), (cx + s // 3, cy), 2)
+
+
+# ---------------------------------------------------------------------------
+# Radar background
+# ---------------------------------------------------------------------------
+
+def draw_radar_bg(surf: pygame.Surface, cx: int, cy: int,
+                  max_r: float) -> None:
+    color = (10, 42, 10)
+    for i in range(1, 6):
+        r = int(max_r * i / 5)
+        pygame.draw.circle(surf, color, (cx, cy), r, 1)
+    pygame.draw.line(surf, color, (int(cx - max_r), cy), (int(cx + max_r), cy), 1)
+    pygame.draw.line(surf, color, (cx, int(cy - max_r)), (cx, int(cy + max_r)), 1)
+    for a_deg in [45, 135]:
+        a = math.radians(a_deg)
+        dx, dy = math.cos(a) * max_r, math.sin(a) * max_r
+        pygame.draw.line(surf, color,
+                         (int(cx - dx), int(cy - dy)),
+                         (int(cx + dx), int(cy + dy)), 1)
+
+
+# ---------------------------------------------------------------------------
+# MatrixRain
+# ---------------------------------------------------------------------------
+
+class MatrixRain:
     CHARS = "abcdefghijklmnopqrstuvwxyz0123456789@#$%&*!?<>{}[]=/\\|~^"
-    COLS  = 30
-    FPS   = 15
-    COMPROMISED_DELAY = 15   # frames before COMPROMISED text appears
+    COLS = 40
 
-    _COLOR_HEAD   = '#FFFFFF'
-    _COLOR_NEAR   = '#00FF00'
-    _COLOR_MID    = '#00CC00'
-    _COLOR_TAIL   = '#005500'
-    _COMPROMISED_FONT = ('Courier', 42, 'bold')
-
-    def __init__(self, parent: tk.Widget) -> None:
-        self._parent  = parent
-        self._canvas  = tk.Canvas(parent, bg='black', highlightthickness=0)
-        self._running  = False
-        self._after_id = None
-        self._frame    = 0
+    def __init__(self, w: int, h: int, font: pygame.freetype.Font) -> None:
+        self._w = w
+        self._h = h
+        self._font = font
+        self._frame = 0
+        self._col_w = max(1, w // self.COLS)
+        self._font_size = max(8, self._col_w - 2)
+        rows = h // self._font_size + 2
         self._streams: list[dict] = []
-        self._w = self._h = 0
-        self._font_size = 14
-        self._font = ('Courier', 14, 'bold')
-
-    @property
-    def running(self) -> bool:
-        return self._running
-
-    def start(self) -> None:
-        self._canvas.place(x=0, y=0, relwidth=1, relheight=1)
-        self._canvas.tk.call('raise', self._canvas._w)
-        self._running = True
-        self._frame   = 0
-        self._parent.update_idletasks()
-        self._w = self._parent.winfo_width()
-        self._h = self._parent.winfo_height()
-        col_w = max(1, self._w // self.COLS)
-        self._font_size = max(8, col_w - 2)
-        self._font = ('Courier', self._font_size, 'bold')
-        rows = self._h // self._font_size + 2
-        self._streams = []
         for c in range(self.COLS):
             self._streams.append({
-                'x':      c * col_w + col_w // 2,
-                'y':      random.randint(-rows, 0),
-                'speed':  random.randint(1, 3),
+                'x': c * self._col_w + self._col_w // 2,
+                'y': random.randint(-rows, 0),
+                'speed': random.randint(1, 3),
                 'length': random.randint(8, rows),
             })
-        self._tick()
+        self._virus_start = 0.0
 
-    def stop(self) -> None:
-        self._running = False
-        if self._after_id:
-            self._parent.after_cancel(self._after_id)
-            self._after_id = None
-        self._canvas.place_forget()
+    def start(self) -> None:
+        self._frame = 0
+        self._virus_start = time.time()
 
-    def _tick(self) -> None:
-        if not self._running:
-            return
-        c = self._canvas
-        c.delete('all')
+    def render(self, surf: pygame.Surface) -> None:
         self._frame += 1
-
-        font = self._font
-        font_size = self._font_size
+        fs = self._font_size
         h = self._h
-        _choice = random.choice
-        chars = self.CHARS
-        create_text = c.create_text
+        w = self._w
+        font = self._font
 
         for s in self._streams:
             s_y = s['y']
             s_len = s['length']
-            half_len = s_len >> 1
-
-            top_row = s_y - s_len + 1
-            if top_row * font_size > h:
-                s['y'] = random.randint(-s_len, 0)
-                s['speed'] = random.randint(1, 3)
-                continue
+            half = s_len >> 1
 
             for i in range(s_len):
-                py = (s_y - i) * font_size
-                if py < -font_size or py > h:
+                py = (s_y - i) * fs
+                if py < -fs or py > h:
                     continue
+                ch = random.choice(self.CHARS)
                 if i == 0:
-                    color = self._COLOR_HEAD
+                    color = (255, 255, 255)
                 elif i <= 2:
-                    color = self._COLOR_NEAR
-                elif i <= half_len:
-                    color = self._COLOR_MID
+                    color = (0, 255, 0)
+                elif i <= half:
+                    color = (0, 180, 0)
                 else:
-                    color = self._COLOR_TAIL
-                create_text(s['x'], py, text=_choice(chars), fill=color,
-                            font=font, anchor='center')
-            s['y'] = s_y + s['speed']
+                    color = (0, 80, 0)
+                font.render_to(surf, (s['x'], py), ch, color)
 
-        w = self._w
-        for _ in range(random.randint(1, 4)):
-            y   = random.randint(0, h)
-            x2  = random.randint(w // 3, w)
-            c.create_line(0, y, x2, y, fill='#CC0000',
-                          width=random.randint(1, 2))
+            s['y'] += s['speed']
+            if s['y'] * fs > h + s['length'] * fs:
+                s['y'] = random.randint(-s['length'], 0)
+                s['speed'] = random.randint(1, 3)
 
-        if self._frame > self.COMPROMISED_DELAY:
-            jx = w // 2 + random.randint(-3, 3)
-            jy = h // 2 + random.randint(-2, 2)
-            comp_font = self._COMPROMISED_FONT
-            create_text(jx + 2, jy + 2, text="COMPROMISED",
-                        fill='#660000', font=comp_font, anchor='center')
-            main_color = '#FF4444' if random.random() < 0.08 else '#FF0000'
-            create_text(jx, jy, text="COMPROMISED",
-                        fill=main_color, font=comp_font, anchor='center')
+        # Red scan lines
+        for _ in range(random.randint(2, 6)):
+            y = random.randint(0, h)
+            x2 = random.randint(w // 3, w)
+            pygame.draw.line(surf, (180, 0, 0), (0, y), (x2, y),
+                             random.randint(1, 2))
 
-        self._after_id = self._parent.after(1000 // self.FPS, self._tick)
+        # WARNING box
+        if self._frame > 20:
+            elapsed = time.time() - self._virus_start
+            mins = int(elapsed) // 60
+            secs = int(elapsed) % 60
+
+            # Header
+            draw_text_centered(surf, font, "COMPROMISED STATUS",
+                               w // 2, 28, (200, 0, 0))
+
+            # Warning box
+            bx, by, bw, bh = w // 8, h // 3, w * 3 // 4, h // 4
+            pygame.draw.rect(surf, (40, 0, 0), (bx, by, bw, bh))
+            pygame.draw.rect(surf, (200, 200, 0), (bx, by, bw, bh), 2)
+
+            font.render_to(surf, (bx + 10, by + 8), "WARNING", (255, 200, 0))
+
+            warn_lines = [
+                "SYSTEM STATUS: MALICIOUS NETWORK INTRUSION DETECTED...",
+                "ANALYZING NETWORK PACKETS..",
+                "CRITICAL FAILURES & ABUSE OF COMMAND, FAILURES.",
+                "SYSTEM.. SYSFAIL FAILURES",
+            ]
+            for i, line in enumerate(warn_lines):
+                font.render_to(surf, (bx + 10, by + 30 + i * 18),
+                               line, (200, 0, 0))
+
+            # Bottom banner
+            jx = random.randint(-2, 2)
+            draw_glow_text(
+                surf, font,
+                "VIRUS ATTACK DETECTED - ALL UNITS COMPROMISED",
+                w // 2 + jx, h - 60, (255, 0, 0), glow_radius=2,
+            )
+            draw_text_centered(surf, font,
+                               f"Attack Duration: {mins:02d}:{secs:02d}",
+                               w // 2, h - 30, (200, 200, 200))
 
 
 # ---------------------------------------------------------------------------
-# TouchUI
+# TouchUI — main controller
 # ---------------------------------------------------------------------------
 
 class TouchUI:
     """
-    Root UI controller.
+    PyGame-based fullscreen kiosk UI.
     Reads ExhibitState for display, dispatches commands to SequenceRunner.
     Never touches GPIO directly.
+
+    Call run() from main — it owns the event loop and blocks until quit.
     """
 
-    def __init__(
-        self,
-        root:  tk.Tk,
-        state: ExhibitState,
-        seq:   "SequenceRunner",
-    ) -> None:
-        self._root  = root
+    # Screen IDs
+    _SCR_IDLE   = 'idle'
+    _SCR_FLIGHT = 'flight'
+    _SCR_FLEET  = 'fleet'
+    _SCR_VIRUS  = 'virus'
+
+    def __init__(self, state: ExhibitState, seq: "SequenceRunner") -> None:
         self._state = state
-        self._seq   = seq
+        self._seq = seq
+        self._running = True
+        self._screen = self._SCR_IDLE
+        self._frame = 0
 
-        self._last_ui_state:   str | None = None
-        self._variant_expanded: bool      = False
-        self._slider_active:    bool      = False
-        self._slider_frac:      float     = self._rot_to_frac(cfg.SLIDER_DEFAULT_ROT)
-        self._last_protected:   frozenset = frozenset()
-
-        # Canvas / widget references populated by build methods
-        self._slider_canvas:  tk.Canvas | None = None
-        self._alt_value:      tk.Label  | None = None
-        self._variant_canvas: tk.Canvas | None = None
-        self._variant_outer:  tk.Frame  | None = None
-        self._drone_frame:    tk.Frame  | None = None
-        self._drone_canvases: dict[int, tk.Canvas] = {}
-        self._drone_frames:   dict[int, tk.Frame]  = {}
-        self._virus_outer:    tk.Frame  | None = None
-        self._virus_canvas:   tk.Canvas | None = None
-        self._toast_label:    tk.Label  | None = None
-        self._toast_after:    str | None = None
-
-        self._configure_root()
-        self._idle_screen  = IdleScreen(root)
-        self._flight_frame = self._build_flight_frame()
-        self._matrix       = MatrixOverlay(root)
-        self._toast_label  = self._build_toast()
-
-        self._idle_screen.show()
-        self._refresh()
-        log.info("TouchUI ready")
-
-    # ── Root window ───────────────────────────────────────────────────────────
-
-    def _configure_root(self) -> None:
-        self._root.title("Variant Security Exhibit")
-        self._root.configure(bg=UI_BG)
-        self._root.overrideredirect(True)
-        self._root.geometry(f'{cfg.DISPLAY_WIDTH}x{cfg.DISPLAY_HEIGHT}+0+0')
-        self._root.config(cursor="none")
-        self._root.bind('<Escape>', lambda e: self._quit())
-
-    # ── Flight frame ──────────────────────────────────────────────────────────
-
-    def _build_flight_frame(self) -> tk.Frame:
-        frame = tk.Frame(self._root, bg=UI_BG)
-        frame.grid_rowconfigure(0, weight=1)
-        frame.grid_columnconfigure(0, weight=15)
-        frame.grid_columnconfigure(1, weight=50)
-        frame.grid_columnconfigure(2, weight=35)
-        self._build_slider_zone(frame)
-        self._build_variant_zone(frame)
-        self._build_virus_zone(frame)
-        return frame
-
-    def _build_slider_zone(self, parent: tk.Frame) -> None:
-        f = tk.Frame(parent, bg=SLIDER_BG)
-        f.grid(row=0, column=0, sticky='nsew', padx=2, pady=2)
-
-        tk.Label(f, text='HEIGHT', bg=SLIDER_BG, fg='#666666',
-                 font=('Courier', 10, 'bold')).pack(pady=(8, 0))
-
-        self._slider_canvas = tk.Canvas(f, bg=SLIDER_BG, highlightthickness=0)
-        self._slider_canvas.pack(fill='both', expand=True, padx=6, pady=2)
-
-        tk.Label(f, text='ALTITUDE:', bg=SLIDER_BG,
-                 fg=SLIDER_GREEN, font=('Courier', 9, 'bold')).pack()
-        self._alt_value = tk.Label(f, text=str(cfg.SLIDER_DEFAULT_ROT),
-                                   bg=SLIDER_BG, fg=SLIDER_GREEN,
-                                   font=('Courier', 28, 'bold'))
-        self._alt_value.pack(pady=(0, 8))
-
-        self._slider_canvas.bind('<Button-1>',        self._on_slider_tap)
-        self._slider_canvas.bind('<B1-Motion>',        self._on_slider_drag)
-        self._slider_canvas.bind('<ButtonRelease-1>',  self._on_slider_release)
-        self._slider_canvas.bind('<Configure>',        lambda e: self._draw_slider())
-
-    def _build_variant_zone(self, parent: tk.Frame) -> None:
-        self._variant_outer = tk.Frame(parent, bg=PANEL_BG,
-                                       highlightbackground=FRAME_BLUE,
-                                       highlightthickness=2)
-        self._variant_outer.grid(row=0, column=1, sticky='nsew', padx=4, pady=4)
-
-        # Collapsed: logo canvas
-        self._variant_canvas = tk.Canvas(self._variant_outer, bg=PANEL_BG,
-                                         highlightthickness=0)
-        self._variant_canvas.pack(fill='both', expand=True)
-        self._variant_canvas.bind('<Button-1>',  lambda e: self._on_variant_tapped())
-        self._variant_canvas.bind('<Configure>',  lambda e: self._draw_variant_logo())
-
-        # Expanded: 2×2 drone grid + DONE
-        self._drone_frame = tk.Frame(self._variant_outer, bg=PANEL_BG)
-        self._drone_frame.grid_rowconfigure(0, weight=1)
-        self._drone_frame.grid_rowconfigure(1, weight=1)
-        self._drone_frame.grid_rowconfigure(2, weight=0)
-        self._drone_frame.grid_columnconfigure(0, weight=1)
-        self._drone_frame.grid_columnconfigure(1, weight=1)
-
-        positions = {1: (0, 0), 2: (0, 1), 3: (1, 0), 4: (1, 1)}
-        for d_id, (r, c) in positions.items():
-            fr = tk.Frame(self._drone_frame, bg=PANEL_BG,
-                          highlightbackground=DRONE_COLORS[d_id],
-                          highlightthickness=2)
-            fr.grid(row=r, column=c, sticky='nsew', padx=3, pady=3)
-            cv = tk.Canvas(fr, bg=PANEL_BG, highlightthickness=0)
-            cv.pack(fill='both', expand=True)
-            cv.bind('<Button-1>', lambda e, did=d_id: self._on_drone_toggle(did))
-            self._drone_canvases[d_id] = cv
-            self._drone_frames[d_id]   = fr
-
-        done_btn = tk.Button(
-            self._drone_frame, text='DONE',
-            font=('Courier', 14, 'bold'),
-            bg=DONE_BLUE, fg='white',
-            activebackground='#1976D2',
-            relief='flat', bd=0, pady=6,
-            command=self._on_variant_collapse,
-        )
-        done_btn.grid(row=2, column=0, columnspan=2, sticky='ew', padx=6, pady=4)
-
-    def _build_virus_zone(self, parent: tk.Frame) -> None:
-        self._virus_outer = tk.Frame(parent, bg='#1a0a0a',
-                                     highlightbackground=FRAME_RED,
-                                     highlightthickness=3)
-        self._virus_outer.grid(row=0, column=2, sticky='nsew', padx=4, pady=4)
-
-        self._virus_canvas = tk.Canvas(self._virus_outer, bg='#1a0a0a',
-                                       highlightthickness=0)
-        self._virus_canvas.pack(fill='both', expand=True)
-        self._virus_canvas.bind('<Button-1>',  lambda e: self._on_virus_tapped())
-        self._virus_canvas.bind('<Configure>',  lambda e: self._draw_virus_button())
-
-    def _build_toast(self) -> tk.Label:
-        return tk.Label(self._root, text='', font=('Courier', 14, 'bold'),
-                        fg='#FFD600', bg='#1a1a1a', padx=16, pady=8)
-
-    # ── Draw: slider ─────────────────────────────────────────────────────────
-
-    def _draw_slider(self) -> None:
-        c = self._slider_canvas
-        if c is None:
-            return
-        c.delete('all')
-        w = c.winfo_width()
-        h = c.winfo_height()
-        if w < 5 or h < 5:
-            return
-
-        pad      = 20
-        track_x  = w // 2
-        track_top = pad
-        track_bot = h - pad
-        track_h   = track_bot - track_top
-
-        # Track
-        c.create_rectangle(track_x - 10, track_top, track_x + 10, track_bot,
-                           fill=SLIDER_TRACK, outline=PANEL_BORDER, width=1)
-
-        # Tick marks with numbers
-        for rot in range(cfg.SLIDER_MIN_ROT, cfg.SLIDER_MAX_ROT + 1, 2):
-            frac = self._rot_to_frac(rot)
-            y    = track_bot - frac * track_h
-            c.create_line(track_x - 14, y, track_x + 14, y, fill='#3a5068', width=1)
-            c.create_text(track_x + 22, y, text=str(rot), fill='#556677',
-                         font=('Courier', 8), anchor='w')
-
-        # Green fill from bottom to thumb
-        frac   = self._slider_frac
-        thumb_y = track_bot - frac * track_h
-        c.create_rectangle(track_x - 9, thumb_y, track_x + 9, track_bot,
-                           fill=SLIDER_GREEN, outline='')
-
-        # Thumb bar
-        c.create_rectangle(track_x - 20, thumb_y - 7,
-                           track_x + 20, thumb_y + 7,
-                           fill=SLIDER_GREEN, outline='#00CC00', width=1)
-
-        # Altitude label — show "from→to" during ADJUSTING_HEIGHT
-        if self._alt_value:
-            st = self._state.current
-            if st == State.ADJUSTING_HEIGHT:
-                fr_v = round(self._state.current_height_rot)
-                to_v = round(self._state.target_height_rot)
-                self._alt_value.config(text=f'{fr_v}→{to_v}', fg=SLIDER_GREEN)
-            else:
-                rot_val = self._frac_to_rot(frac)
-                self._alt_value.config(text=f'{rot_val:.0f}', fg=SLIDER_GREEN)
-
-    # ── Draw: variant logo ─────────────────────────────────────────────────────
-
-    def _draw_variant_logo(self) -> None:
-        c = self._variant_canvas
-        if c is None:
-            return
-        c.delete('all')
-        w = c.winfo_width()
-        h = c.winfo_height()
-        if w < 10 or h < 10:
-            return
-        cx, cy = w // 2, h // 2
-
-        c.create_text(cx, 25, text="VARIANT CONTROL", fill='#cccccc',
-                      font=('Helvetica', 14, 'bold'), anchor='center')
-        IdleScreen._draw_logo_mark(c, cx, cy, min(w, h) * 0.40, 'white')
-        c.create_text(cx, h - 16, text="TAP TO CONFIGURE", fill='#556677',
-                      font=('Courier', 10), anchor='center')
-
-    # ── Draw: drone toggle card ────────────────────────────────────────────────
-
-    def _draw_drone_toggle(self, d_id: int) -> None:
-        cv = self._drone_canvases.get(d_id)
-        fr = self._drone_frames.get(d_id)
-        if cv is None or fr is None:
-            return
-        cv.delete('all')
-        w = cv.winfo_width()
-        h = cv.winfo_height()
-        if w < 10 or h < 10:
-            return
-        cx, cy = w // 2, h // 2
-
-        is_protected = d_id in self._state.protected_drones
-        color = DRONE_COLORS[d_id]
-
-        if is_protected:
-            cv.configure(bg=color)
-            fr.configure(bg=color, highlightbackground=color)
-            cv.create_text(cx, 18, text=DRONE_LABELS[d_id],
-                           fill='white', font=('Helvetica', 16, 'bold'), anchor='center')
-            self._draw_lock_icon(cv, cx, cy - 5, 20, 'white')
-            cv.create_text(cx, h - 18, text="SELECTED",
-                           fill='white', font=('Courier', 11, 'bold'), anchor='center')
-        else:
-            cv.configure(bg=PANEL_BG)
-            fr.configure(bg=PANEL_BG, highlightbackground=PANEL_BORDER)
-            cv.create_text(cx, 18, text=DRONE_LABELS[d_id],
-                           fill='#888888', font=('Helvetica', 16, 'bold'), anchor='center')
-            self._draw_drone_silhouette(cv, cx, cy, min(w, h) * 0.3, '#556677')
-
-    # ── Draw: virus button ─────────────────────────────────────────────────────
-
-    def _draw_virus_button(self, enabled: bool = True) -> None:
-        c = self._virus_canvas
-        if c is None:
-            return
-        c.delete('all')
-        w = c.winfo_width()
-        h = c.winfo_height()
-        if w < 10 or h < 10:
-            return
-        cx, cy = w // 2, h // 2
-
-        if enabled:
-            bg, icon_color, text_color, hdr_color = '#1a0a0a','#CC0000','#FF2222','#cccccc'
-        else:
-            bg, icon_color, text_color, hdr_color = '#0a0a0a','#333333','#444444','#444444'
-
-        c.configure(bg=bg)
-        c.create_text(cx, 22, text="VIRUS TRIGGER", fill=hdr_color,
-                      font=('Helvetica', 12, 'bold'), anchor='center')
-        self._draw_biohazard(c, cx, cy, min(w, h) * 0.35, icon_color)
-        c.create_text(cx, h - 25, text="VIRUS",
-                      fill=text_color, font=('Helvetica', 20, 'bold'), anchor='center')
-
-    # ── Static draw primitives ─────────────────────────────────────────────────
-
-    @staticmethod
-    def _draw_drone_silhouette(
-        canvas: tk.Canvas, cx: int, cy: int, size: float, color: str,
-    ) -> None:
-        s = size / 30
-        canvas.create_rectangle(cx - 6*s, cy - 3*s, cx + 6*s, cy + 3*s,
-                                fill=color, outline='')
-        for dx, dy in [(-1, -1), (1, -1), (-1, 1), (1, 1)]:
-            ax, ay = cx + dx * 14*s, cy + dy * 10*s
-            canvas.create_line(cx + dx*5*s, cy + dy*2*s, ax, ay,
-                               fill=color, width=max(1, int(1.5*s)))
-            canvas.create_oval(ax - 6*s, ay - 6*s, ax + 6*s, ay + 6*s,
-                               outline=color, fill='', width=max(1, int(s)))
-
-    @staticmethod
-    def _draw_lock_icon(
-        canvas: tk.Canvas, cx: int, cy: int, size: float, color: str,
-    ) -> None:
-        s = size / 12
-        canvas.create_rectangle(cx - 5*s, cy - 2*s, cx + 5*s, cy + 6*s,
-                                fill=color, outline='')
-        canvas.create_arc(cx - 4*s, cy - 8*s, cx + 4*s, cy,
-                         start=0, extent=180, style='arc',
-                         outline=color, width=max(1, int(2*s)))
-
-    @staticmethod
-    def _draw_biohazard(
-        canvas: tk.Canvas, cx: int, cy: int, size: float, color: str,
-    ) -> None:
-        s = size / 50
-        for angle_deg in [90, 210, 330]:
-            a  = math.radians(angle_deg)
-            ox = cx + math.cos(a) * 16*s
-            oy = cy - math.sin(a) * 16*s
-            r  = 14*s
-            canvas.create_oval(ox - r, oy - r, ox + r, oy + r,
-                               outline=color, fill='', width=max(1, int(2*s)))
-        canvas.create_oval(cx - 5*s, cy - 5*s, cx + 5*s, cy + 5*s,
-                          outline=color, fill='', width=max(1, int(2*s)))
-        canvas.create_oval(cx - 2*s, cy - 2*s, cx + 2*s, cy + 2*s,
-                          fill=color, outline='')
-
-    # ── Touch event handlers ───────────────────────────────────────────────────
-
-    def _on_slider_tap(self, event: tk.Event) -> None:
-        if self._state.current not in (State.FLIGHT, State.ADJUSTING_HEIGHT):
-            return
-        self._slider_active = True
-        self._slider_frac   = self._y_to_frac(event.y)
-        self._draw_slider()
-
-    def _on_slider_drag(self, event: tk.Event) -> None:
-        if not self._slider_active:
-            return
-        self._slider_frac = self._y_to_frac(event.y)
-        self._draw_slider()
-
-    def _on_slider_release(self, event: tk.Event) -> None:
-        if not self._slider_active:
-            return
+        # Slider state
         self._slider_active = False
-        target = round(self._frac_to_rot(self._slider_frac))
-        self._slider_frac = self._rot_to_frac(target)
-        self._draw_slider()
-        if target != round(self._state.current_height_rot):
-            self._seq.request_height_change(float(target))
+        self._slider_frac = rot_to_frac(cfg.SLIDER_DEFAULT_ROT)
 
-    def _on_variant_tapped(self) -> None:
-        if self._state.current != State.FLIGHT:
-            return
-        self._variant_expanded = True
-        self._variant_canvas.pack_forget()
-        self._drone_frame.pack(fill='both', expand=True)
-        self._update_all_drone_toggles()
+        # Fleet panel expanded
+        self._fleet_expanded = False
+        self._last_protected: frozenset = frozenset()
 
-    def _on_variant_collapse(self) -> None:
-        self._variant_expanded = False
-        self._drone_frame.pack_forget()
-        self._variant_canvas.pack(fill='both', expand=True)
-        self._root.after(50, self._draw_variant_logo)
+        # Toast
+        self._toast_text = ''
+        self._toast_until = 0.0
 
-    def _on_drone_toggle(self, drone_id: int) -> None:
-        self._state.toggle_drone(drone_id)
-        self._update_all_drone_toggles()
+        pygame.init()
+        pygame.mouse.set_visible(False)
 
-    def _update_all_drone_toggles(self) -> None:
-        for d_id in self._drone_canvases:
-            self._root.after(10, lambda did=d_id: self._draw_drone_toggle(did))
+        self._display = pygame.display.set_mode((W, H), pygame.FULLSCREEN)
+        pygame.display.set_caption("Variant Security Exhibit")
+        self._clock = pygame.time.Clock()
 
-    def _on_virus_tapped(self) -> None:
+        # Fonts
+        pygame.freetype.init()
+        self._fn_lg = pygame.freetype.SysFont('couriernew,courier,monospace', 32)
+        self._fn_md = pygame.freetype.SysFont('couriernew,courier,monospace', 20)
+        self._fn_sm = pygame.freetype.SysFont('couriernew,courier,monospace', 14)
+        self._fn_xs = pygame.freetype.SysFont('couriernew,courier,monospace', 11)
+        self._fn_title = pygame.freetype.SysFont('helvetica,arial,sans-serif', 28)
+        self._fn_hdr = pygame.freetype.SysFont('helvetica,arial,sans-serif', 16)
+        self._fn_big = pygame.freetype.SysFont('couriernew,courier,monospace', 42)
+
+        # Matrix rain (lazy init on first virus screen)
+        self._matrix: MatrixRain | None = None
+
+        # Hit zones (populated during render)
+        self._zone_slider = pygame.Rect(0, 0, 0, 0)
+        self._zone_variant = pygame.Rect(0, 0, 0, 0)
+        self._zone_virus = pygame.Rect(0, 0, 0, 0)
+        self._zone_done = pygame.Rect(0, 0, 0, 0)
+        self._zone_drones: dict[int, pygame.Rect] = {}
+
+        log.info("TouchUI (PyGame) ready — %dx%d @ %d fps", W, H, FPS)
+
+    # ── Main loop ─────────────────────────────────────────────────────────
+
+    def run(self) -> None:
+        """Blocking event loop. Returns on quit/Escape/shutdown."""
+        try:
+            while self._running:
+                self._handle_events()
+                self._sync_screen()
+                self._render()
+                self._clock.tick(FPS)
+                self._frame += 1
+        except KeyboardInterrupt:
+            log.info("KeyboardInterrupt in UI loop")
+        finally:
+            pygame.quit()
+
+    def request_quit(self) -> None:
+        self._running = False
+
+    # ── Event handling ────────────────────────────────────────────────────
+
+    def _handle_events(self) -> None:
+        for ev in pygame.event.get():
+            if ev.type == pygame.QUIT:
+                self._running = False
+            elif ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE:
+                self._running = False
+
+            elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+                self._on_tap(ev.pos)
+            elif ev.type == pygame.MOUSEMOTION and pygame.mouse.get_pressed()[0]:
+                self._on_drag(ev.pos)
+            elif ev.type == pygame.MOUSEBUTTONUP and ev.button == 1:
+                self._on_release(ev.pos)
+
+    def _on_tap(self, pos: tuple) -> None:
+        x, y = pos
+
+        if self._screen in (self._SCR_FLIGHT, self._SCR_FLEET):
+            if self._zone_slider.collidepoint(x, y):
+                st = self._state.current
+                if st in (State.FLIGHT, State.ADJUSTING_HEIGHT):
+                    self._slider_active = True
+                    self._slider_frac = self._y_to_frac(y, self._zone_slider)
+                return
+
+        if self._screen == self._SCR_FLIGHT:
+            if self._zone_variant.collidepoint(x, y):
+                if self._state.current == State.FLIGHT:
+                    self._fleet_expanded = True
+                    self._screen = self._SCR_FLEET
+                return
+            if self._zone_virus.collidepoint(x, y):
+                self._trigger_virus()
+                return
+
+        if self._screen == self._SCR_FLEET:
+            for d_id, zone in self._zone_drones.items():
+                if zone.collidepoint(x, y):
+                    self._state.toggle_drone(d_id)
+                    return
+            if self._zone_done.collidepoint(x, y):
+                self._fleet_expanded = False
+                self._screen = self._SCR_FLIGHT
+                return
+
+    def _on_drag(self, pos: tuple) -> None:
+        if self._slider_active:
+            self._slider_frac = self._y_to_frac(pos[1], self._zone_slider)
+
+    def _on_release(self, pos: tuple) -> None:
+        if self._slider_active:
+            self._slider_active = False
+            target = round(frac_to_rot(self._slider_frac))
+            self._slider_frac = rot_to_frac(target)
+            if target != round(self._state.current_height_rot):
+                self._seq.request_height_change(float(target))
+
+    def _trigger_virus(self) -> None:
         if self._state.current != State.FLIGHT:
             return
         if len(self._state.protected_drones) >= 4:
             self._show_toast("Cannot infect — all drones protected")
             return
+        self._screen = self._SCR_VIRUS
+        if self._matrix is None:
+            self._matrix = MatrixRain(W, H, self._fn_sm)
         self._matrix.start()
         threading.Thread(
             target=self._seq.trigger_virus,
@@ -666,117 +462,322 @@ class TouchUI:
             name="virus-ui",
         ).start()
 
-    # ── Refresh loop ──────────────────────────────────────────────────────────
+    def _show_toast(self, msg: str, duration: float = 2.0) -> None:
+        self._toast_text = msg
+        self._toast_until = time.time() + duration
 
-    def _refresh(self) -> None:
-        """100ms polling loop — syncs visible screen to ExhibitState.current."""
-        try:
-            self._refresh_inner()
-        except Exception:
-            log.exception("_refresh_inner error — UI loop continuing")
-        finally:
-            self._root.after(UI_REFRESH_MS, self._refresh)
+    # ── State sync ────────────────────────────────────────────────────────
 
-    def _refresh_inner(self) -> None:
-        st           = self._state.current
-        is_idle      = st == State.IDLE
-        in_flight    = st == State.FLIGHT
-        adjusting    = st == State.ADJUSTING_HEIGHT
-        is_virus     = st in (State.VIRUS, State.POST_VIRUS_FLIGHT, State.RETURNING_HOME)
-        flight_or_adj = in_flight or adjusting
+    def _sync_screen(self) -> None:
+        st = self._state.current
+        if st == State.IDLE:
+            if self._screen != self._SCR_IDLE:
+                self._fleet_expanded = False
+            self._screen = self._SCR_IDLE
+        elif st in (State.FLIGHT, State.ADJUSTING_HEIGHT):
+            if self._screen == self._SCR_IDLE:
+                self._screen = self._SCR_FLIGHT
+            elif self._screen == self._SCR_VIRUS:
+                self._screen = self._SCR_FLIGHT
+        elif st in (State.LAUNCH_SLOW, State.LAUNCH_FAST):
+            self._screen = self._SCR_IDLE
+        elif st in (State.VIRUS, State.POST_VIRUS_FLIGHT, State.RETURNING_HOME):
+            if self._screen != self._SCR_VIRUS:
+                if self._matrix is None:
+                    self._matrix = MatrixRain(W, H, self._fn_sm)
+                self._matrix.start()
+                self._screen = self._SCR_VIRUS
 
-        # ── IDLE ─────────────────────────────────────────────────────────────
-        if is_idle and self._last_ui_state != 'idle':
-            self._flight_frame.place_forget()
-            if self._matrix.running:
-                self._matrix.stop()
-            if self._variant_expanded:
-                self._on_variant_collapse()
-            self._idle_screen.show()
-            self._last_ui_state = 'idle'
+        if not self._slider_active and self._screen in (self._SCR_FLIGHT, self._SCR_FLEET):
+            self._slider_frac = rot_to_frac(self._state.current_height_rot)
 
-        # ── FLIGHT / ADJUSTING ────────────────────────────────────────────────
-        if flight_or_adj and self._last_ui_state not in ('flight', 'adjusting'):
-            self._idle_screen.hide()
-            self._flight_frame.place(x=0, y=0, relwidth=1, relheight=1)
-            self._flight_frame.tk.call('raise', self._flight_frame._w)
-            self._root.after(50, self._safe_initial_draw)
-            self._last_ui_state = 'adjusting' if adjusting else 'flight'
+    # ── Render dispatch ───────────────────────────────────────────────────
 
-        # ── VIRUS (matrix started by _on_virus_tapped) ───────────────────────
-        if is_virus and self._last_ui_state not in ('virus', 'returning'):
-            self._last_ui_state = 'virus'
+    def _render(self) -> None:
+        surf = self._display
+        surf.fill(C_BG)
 
-        # Stop matrix when returning to IDLE
-        if is_idle and self._matrix.running:
-            self._matrix.stop()
+        if self._screen == self._SCR_IDLE:
+            self._render_idle(surf)
+        elif self._screen == self._SCR_FLIGHT:
+            self._render_flight(surf)
+        elif self._screen == self._SCR_FLEET:
+            self._render_fleet(surf)
+        elif self._screen == self._SCR_VIRUS:
+            self._render_virus(surf)
 
-        # ── Per-frame FLIGHT updates ───────────────────────────────────────────
-        if flight_or_adj:
-            if not self._slider_active:
-                self._slider_frac = self._rot_to_frac(self._state.current_height_rot)
-                self._draw_slider()
+        # Toast overlay
+        if self._toast_text and time.time() < self._toast_until:
+            self._render_toast(surf)
 
-            border_blue = FRAME_BLUE  if in_flight else '#222222'
-            border_red  = FRAME_RED   if in_flight else '#222222'
-            if self._variant_outer:
-                self._variant_outer.config(highlightbackground=border_blue)
-            if self._virus_outer:
-                self._virus_outer.config(highlightbackground=border_red)
+        pygame.display.flip()
 
-            if self._variant_expanded:
-                current_protected = frozenset(self._state.protected_drones)
-                if current_protected != self._last_protected:
-                    self._last_protected = current_protected
-                    self._update_all_drone_toggles()
+    # ── IDLE screen ───────────────────────────────────────────────────────
 
-            self._last_ui_state = 'adjusting' if adjusting else 'flight'
+    def _render_idle(self, surf: pygame.Surface) -> None:
+        cx, cy = W // 2, H // 2
 
-    def _safe_initial_draw(self) -> None:
-        """Called once after flight_frame is placed to draw initial content."""
-        try:
-            self._draw_variant_logo()
-            self._draw_slider()
-            self._draw_virus_button(self._state.current == State.FLIGHT)
-        except Exception as exc:
-            log.warning("Initial flight draw error (will retry): %s", exc)
+        # Radar background
+        draw_radar_bg(surf, cx, cy, min(W, H) * 0.45)
 
-    # ── Toast ─────────────────────────────────────────────────────────────────
+        # Breathing pulse
+        t = self._frame / (FPS * 5.0)
+        alpha = 0.4 + 0.6 * (0.5 - 0.5 * math.cos(t * 2 * math.pi))
+        v = int(alpha * 255)
 
-    def _show_toast(self, msg: str, duration_ms: int = 2000) -> None:
-        if self._toast_label is None:
+        # Panel
+        pw, ph = min(W - 80, 520), min(H - 60, 380)
+        px, py = cx - pw // 2, cy - ph // 2 + 10
+        panel_r = pygame.Rect(px, py, pw, ph)
+
+        border_c = lerp_color((10, 40, 60), C_BORDER_BLUE, alpha)
+        draw_panel(surf, panel_r, C_PANEL, border_c, 2, corner=20)
+
+        # Red indicators top corners
+        pygame.draw.circle(surf, lerp_color((60, 0, 0), (255, 0, 0), alpha),
+                           (px + 15, py + 15), 5)
+        pygame.draw.circle(surf, lerp_color((60, 0, 0), (255, 0, 0), alpha),
+                           (px + pw - 15, py + 15), 5)
+
+        # Title
+        title_c = (v, v, v)
+        draw_glow_text(surf, self._fn_title, "VARIANT SECURITY",
+                       cx, py + 50, title_c, glow_radius=2)
+
+        # Brick logo
+        logo_c = lerp_color((30, 80, 50), C_GREEN, alpha)
+        draw_brick_logo(surf, cx, cy + 20, min(pw, ph) * 0.38, logo_c)
+
+        # Footer
+        st = self._state.current
+        if st in (State.LAUNCH_SLOW, State.LAUNCH_FAST):
+            footer = "LAUNCH SEQUENCE IN PROGRESS"
+            footer_c = C_GREEN_MID
+        else:
+            footer = "SYSTEM STANDBY | LAUNCH INITIATION REQUIRED"
+            footer_c = C_TEXT_DIM
+        draw_text_centered(surf, self._fn_xs, footer,
+                           cx, py + ph - 20, footer_c)
+
+    # ── FLIGHT OPERATIONS screen ──────────────────────────────────────────
+
+    def _render_flight(self, surf: pygame.Surface) -> None:
+        # Header
+        draw_text_centered(surf, self._fn_hdr, "FLIGHT OPERATIONS",
+                           W // 2, 16, C_TEXT)
+        pygame.draw.line(surf, C_BORDER, (10, 32), (W - 10, 32), 1)
+
+        # Three-column layout
+        col_y = 40
+        col_h = H - col_y - 8
+        slider_w = int(W * 0.15)
+        variant_w = int(W * 0.50)
+        virus_w = W - slider_w - variant_w - 24
+
+        # --- ALTITUDE CONTROL (left) ---
+        sr = pygame.Rect(6, col_y, slider_w, col_h)
+        self._zone_slider = sr
+        draw_panel(surf, sr, C_SLIDER_BG, C_BORDER_BLUE, 2, corner=10)
+        draw_text_centered(surf, self._fn_xs, "ALTITUDE CONTROL",
+                           sr.centerx, sr.top + 16, C_TEXT_DIM)
+        self._draw_slider(surf, sr)
+
+        # --- DRONE SECURITY (center) ---
+        vr = pygame.Rect(slider_w + 12, col_y, variant_w, col_h)
+        self._zone_variant = vr
+        draw_panel(surf, vr, C_PANEL, C_BORDER_BLUE, 2, corner=12)
+        draw_text_centered(surf, self._fn_hdr, "DRONE SECURITY",
+                           vr.centerx, vr.top + 22, C_TEXT)
+
+        # Brick logo in center
+        logo_alpha = 0.5 + 0.5 * math.sin(self._frame / 30.0)
+        logo_c = lerp_color((30, 60, 40), C_GREEN, logo_alpha)
+        draw_brick_logo(surf, vr.centerx, vr.centery - 10,
+                        min(vr.width, vr.height) * 0.35, logo_c)
+
+        # Status text
+        n_prot = len(self._state.protected_drones)
+        if n_prot > 0:
+            status = f"{n_prot}/4 DRONES PROTECTED"
+            status_c = C_CYAN
+        else:
+            status = "TAP TO CONFIGURE DRONE FLEET"
+            status_c = C_TEXT_DIM
+        draw_text_centered(surf, self._fn_xs, status,
+                           vr.centerx, vr.bottom - 22, status_c)
+
+        # --- VIRUS ISOLATION (right) ---
+        xr = pygame.Rect(slider_w + variant_w + 18, col_y, virus_w, col_h)
+        self._zone_virus = xr
+        enabled = self._state.current == State.FLIGHT
+        virus_border = C_BORDER_RED if enabled else (40, 40, 40)
+        draw_panel(surf, xr, C_VIRUS_BG, virus_border, 3, corner=10)
+        draw_text_centered(surf, self._fn_xs, "VIRUS ISOLATION",
+                           xr.centerx, xr.top + 18, C_TEXT if enabled else (60, 60, 60))
+
+        # Warning triangles
+        if enabled:
+            for tx in [xr.left + 16, xr.right - 16]:
+                pts = [(tx, xr.top + 10), (tx - 6, xr.top + 22), (tx + 6, xr.top + 22)]
+                pygame.draw.polygon(surf, C_YELLOW, pts)
+                pygame.draw.polygon(surf, C_BG, pts, 1)
+
+        bio_c = C_RED if enabled else (50, 50, 50)
+        draw_biohazard(surf, xr.centerx, xr.centery,
+                       min(xr.width, xr.height) * 0.35, bio_c)
+
+        label_c = C_RED_BRIGHT if enabled else (60, 60, 60)
+        draw_text_centered(surf, self._fn_md, "VIRUS",
+                           xr.centerx, xr.bottom - 35, label_c)
+        draw_text_centered(surf, self._fn_xs, "TAP TO ISOLATE",
+                           xr.centerx, xr.bottom - 16, C_TEXT_DIM if enabled else (40, 40, 40))
+
+    # ── FLEET OVERVIEW (expanded drone selection) ─────────────────────────
+
+    def _render_fleet(self, surf: pygame.Surface) -> None:
+        # Header
+        draw_text_centered(surf, self._fn_hdr, "FLEET OVERVIEW",
+                           W // 2, 16, C_TEXT)
+        pygame.draw.line(surf, C_BORDER, (10, 32), (W - 10, 32), 1)
+
+        col_y = 40
+        col_h = H - col_y - 8
+        slider_w = int(W * 0.15)
+
+        # Slider (left)
+        sr = pygame.Rect(6, col_y, slider_w, col_h)
+        self._zone_slider = sr
+        draw_panel(surf, sr, C_SLIDER_BG, C_BORDER_BLUE, 2, corner=10)
+        draw_text_centered(surf, self._fn_xs, "HEIGHT",
+                           sr.centerx, sr.top + 16, C_TEXT_DIM)
+        self._draw_slider(surf, sr)
+
+        # Drone grid (center + right)
+        grid_x = slider_w + 16
+        grid_w = W - grid_x - 8
+        grid_y = col_y + 4
+        grid_h = col_h - 50
+        cell_w = (grid_w - 12) // 2
+        cell_h = (grid_h - 12) // 2
+
+        positions = {1: (0, 0), 2: (0, 1), 3: (1, 0), 4: (1, 1)}
+        for d_id, (row, col) in positions.items():
+            cx = grid_x + col * (cell_w + 8)
+            cy_pos = grid_y + row * (cell_h + 8)
+            rect = pygame.Rect(cx, cy_pos, cell_w, cell_h)
+            self._zone_drones[d_id] = rect
+            self._draw_drone_card(surf, rect, d_id)
+
+        # DONE button
+        done_r = pygame.Rect(grid_x, grid_y + grid_h + 4, grid_w, 38)
+        self._zone_done = done_r
+        pygame.draw.rect(surf, C_PANEL_LITE, done_r)
+        pygame.draw.rect(surf, C_BORDER, done_r, 2)
+        draw_text_centered(surf, self._fn_md, "DONE",
+                           done_r.centerx, done_r.centery, C_TEXT)
+
+        # Footer
+        draw_text_centered(surf, self._fn_xs,
+                           "SYSTEM STANDBY | LAUNCH INITIATION REQUIRED",
+                           W // 2, H - 12, C_TEXT_DIM)
+
+    def _draw_drone_card(self, surf: pygame.Surface, rect: pygame.Rect,
+                         d_id: int) -> None:
+        color = DRONE_COLORS[d_id]
+        is_prot = d_id in self._state.protected_drones
+        cx, cy = rect.centerx, rect.centery
+
+        if is_prot:
+            pygame.draw.rect(surf, color, rect)
+            pygame.draw.rect(surf, (255, 255, 255), rect, 2)
+            draw_text_centered(surf, self._fn_md, DRONE_LABELS[d_id],
+                               cx, rect.top + 22, (255, 255, 255))
+            draw_shield(surf, cx, cy, 18, (255, 255, 255))
+            draw_text_centered(surf, self._fn_sm, "READY",
+                               cx, rect.bottom - 20, (255, 255, 255))
+        else:
+            pygame.draw.rect(surf, C_PANEL, rect)
+            pygame.draw.rect(surf, color, rect, 2)
+            draw_text_centered(surf, self._fn_md, DRONE_LABELS[d_id],
+                               cx, rect.top + 22, color)
+            draw_shield(surf, cx, cy, 16, (80, 80, 80))
+            draw_text_centered(surf, self._fn_sm, "PENDING",
+                               cx, rect.bottom - 20, C_TEXT_DIM)
+
+    # ── VIRUS / COMPROMISED screen ────────────────────────────────────────
+
+    def _render_virus(self, surf: pygame.Surface) -> None:
+        if self._matrix is not None:
+            self._matrix.render(surf)
+
+    # ── Slider rendering ──────────────────────────────────────────────────
+
+    def _draw_slider(self, surf: pygame.Surface, area: pygame.Rect) -> None:
+        pad = 35
+        track_x = area.centerx
+        track_top = area.top + pad
+        track_bot = area.bottom - 60
+        track_h = track_bot - track_top
+        if track_h < 10:
             return
-        self._toast_label.config(text=msg)
-        self._toast_label.place(relx=0.5, rely=0.5, anchor='center')
-        self._toast_label.lift()
-        if self._toast_after:
-            self._root.after_cancel(self._toast_after)
-        self._toast_after = self._root.after(
-            duration_ms,
-            lambda: self._toast_label.place_forget() if self._toast_label else None,
-        )
 
-    # ── Quit ─────────────────────────────────────────────────────────────────
+        # Track background
+        pygame.draw.rect(surf, C_SLIDER_TRACK,
+                         (track_x - 8, track_top, 16, track_h))
+        pygame.draw.rect(surf, C_BORDER,
+                         (track_x - 8, track_top, 16, track_h), 1)
 
-    def _quit(self) -> None:
-        log.info("TouchUI quit requested")
-        self._root.destroy()
+        # Tick marks
+        for rot in range(cfg.SLIDER_MIN_ROT, cfg.SLIDER_MAX_ROT + 1, 2):
+            frac = rot_to_frac(rot)
+            y = int(track_bot - frac * track_h)
+            pygame.draw.line(surf, C_BORDER,
+                             (track_x - 12, y), (track_x + 12, y), 1)
+            self._fn_xs.render_to(surf, (track_x + 16, y - 5),
+                                  str(rot), C_TEXT_DIM)
 
-    # ── Coordinate helpers ────────────────────────────────────────────────────
+        # Green fill
+        frac = self._slider_frac
+        thumb_y = int(track_bot - frac * track_h)
+        pygame.draw.rect(surf, C_GREEN,
+                         (track_x - 7, thumb_y, 14, track_bot - thumb_y))
 
-    def _y_to_frac(self, y: int) -> float:
-        if self._slider_canvas is None:
-            return 0.5
-        h   = self._slider_canvas.winfo_height()
-        pad = 20
-        frac = ((h - pad) - y) / max(1, h - 2 * pad)
+        # Thumb
+        pygame.draw.rect(surf, C_GREEN,
+                         (track_x - 16, thumb_y - 5, 32, 10))
+        pygame.draw.rect(surf, C_GREEN_MID,
+                         (track_x - 16, thumb_y - 5, 32, 10), 1)
+
+        # Value display
+        st = self._state.current
+        if st == State.ADJUSTING_HEIGHT:
+            fr_v = round(self._state.current_height_rot)
+            to_v = round(self._state.target_height_rot)
+            val_text = f"{fr_v}>{to_v}"
+        else:
+            val_text = f"{frac_to_rot(frac):.0f}"
+
+        draw_text_centered(surf, self._fn_lg, val_text,
+                           area.centerx, area.bottom - 30, C_GREEN)
+
+    # ── Toast ─────────────────────────────────────────────────────────────
+
+    def _render_toast(self, surf: pygame.Surface) -> None:
+        r = self._fn_md.get_rect(self._toast_text)
+        bw, bh = r.width + 32, r.height + 20
+        bx, by = (W - bw) // 2, (H - bh) // 2
+        pygame.draw.rect(surf, (26, 26, 26), (bx, by, bw, bh))
+        pygame.draw.rect(surf, C_YELLOW, (bx, by, bw, bh), 2)
+        draw_text_centered(surf, self._fn_md, self._toast_text,
+                           W // 2, H // 2, C_YELLOW)
+
+    # ── Coordinate helpers ────────────────────────────────────────────────
+
+    @staticmethod
+    def _y_to_frac(y: int, slider_rect: pygame.Rect) -> float:
+        pad = 35
+        track_top = slider_rect.top + pad
+        track_bot = slider_rect.bottom - 60
+        track_h = max(1, track_bot - track_top)
+        frac = (track_bot - y) / track_h
         return max(0.0, min(1.0, frac))
-
-    @staticmethod
-    def _rot_to_frac(rot: float) -> float:
-        return (rot - cfg.SLIDER_MIN_ROT) / _SLIDER_RANGE
-
-    @staticmethod
-    def _frac_to_rot(frac: float) -> float:
-        frac = max(0.0, min(1.0, frac))
-        return cfg.SLIDER_MIN_ROT + frac * _SLIDER_RANGE

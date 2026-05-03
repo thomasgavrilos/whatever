@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 main.py — Variant Security Drone Exhibit v11
-Entry point. Wires all modules, starts threads, runs Tk event loop.
+Entry point. Wires all modules, starts threads, runs PyGame event loop.
 
 Run
 ---
@@ -10,7 +10,7 @@ Run
 
 import logging
 import sys
-import tkinter as tk
+import os
 
 from config import cfg
 from exhibit_state import ExhibitState
@@ -65,6 +65,10 @@ def main() -> None:
     log.info("  VARIANT SECURITY DRONE EXHIBIT  v11")
     log.info("=" * 60)
 
+    # Hide SDL debug noise on the DSI touchscreen
+    os.environ.setdefault('SDL_VIDEO_ALLOW_SCREENSAVER', '0')
+    os.environ.setdefault('SDL_MOUSE_TOUCH_EVENTS', '1')
+
     # ── Instantiate all layers ────────────────────────────────────────────────
     state  = ExhibitState()
     motors = MotorController()
@@ -107,11 +111,10 @@ def main() -> None:
     log.info("-" * 60)
 
     # ── Build UI and enter event loop ─────────────────────────────────────────
-    root = tk.Tk()
-    _ui  = TouchUI(root=root, state=state, seq=seq)   # noqa: F841
+    ui = TouchUI(state=state, seq=seq)
 
     try:
-        root.mainloop()
+        ui.run()
 
     except KeyboardInterrupt:
         log.info("KeyboardInterrupt received — beginning safe shutdown …")
