@@ -339,11 +339,16 @@ class TouchUI:
         self._toast_text = ''
         self._toast_until = 0.0
 
+        import os
+        os.environ.setdefault('SDL_VIDEO_WINDOW_POS', '0,0')
+
         pygame.init()
         pygame.mouse.set_visible(False)
+        log.info("PyGame initialised — trying display …")
 
-        self._display = pygame.display.set_mode((W, H), pygame.FULLSCREEN)
+        self._display = pygame.display.set_mode((W, H), pygame.NOFRAME)
         pygame.display.set_caption("Variant Security Exhibit")
+        log.info("Display opened — %dx%d NOFRAME", W, H)
         self._clock = pygame.time.Clock()
 
         # Fonts
