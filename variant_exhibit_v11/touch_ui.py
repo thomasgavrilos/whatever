@@ -397,6 +397,10 @@ class TouchUI:
 
     # ── Event handling ────────────────────────────────────────────────────
 
+    def _finger_pos(self, ev) -> tuple[int, int]:
+        """Convert FINGER* event normalised coords (0.0-1.0) to pixels."""
+        return (int(ev.x * W), int(ev.y * H))
+
     def _handle_events(self) -> None:
         for ev in pygame.event.get():
             if ev.type == pygame.QUIT:
@@ -404,12 +408,21 @@ class TouchUI:
             elif ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE:
                 self._running = False
 
+            # Mouse events (desktop / some touchscreens via SDL)
             elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
                 self._on_tap(ev.pos)
             elif ev.type == pygame.MOUSEMOTION and pygame.mouse.get_pressed()[0]:
                 self._on_drag(ev.pos)
             elif ev.type == pygame.MOUSEBUTTONUP and ev.button == 1:
                 self._on_release(ev.pos)
+
+            # SDL2 finger/touch events (DSI touchscreen on Wayland)
+            elif ev.type == pygame.FINGERDOWN:
+                self._on_tap(self._finger_pos(ev))
+            elif ev.type == pygame.FINGERMOTION:
+                self._on_drag(self._finger_pos(ev))
+            elif ev.type == pygame.FINGERUP:
+                self._on_release(self._finger_pos(ev))
 
     def _on_tap(self, pos: tuple) -> None:
         x, y = pos
